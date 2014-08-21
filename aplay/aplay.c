@@ -88,6 +88,13 @@ enum {
 	VUMETER_STEREO
 };
 
+typedef struct write_buffer_t {
+    struct write_buffer_t *next;
+    size_t len;
+    off64_t written;
+    char *data;
+} write_buffer_t;
+
 static char *command;
 static snd_pcm_t *handle;
 static struct {
@@ -2697,6 +2704,8 @@ static void capture(char *orig_name)
 	char *name = orig_name;	/* current filename */
 	char namebuf[PATH_MAX+1];
 	off64_t count, rest;		/* number of bytes to capture */
+    write_buffer_t *buf_start = NULL;
+    write_buffer_t *buf_end   = NULL;
 
 	/* get number of bytes to capture */
 	count = calc_count();
@@ -2762,20 +2771,84 @@ static void capture(char *orig_name)
 
 		/* capture */
 		fdcount = 0;
+
+        int orig_mode = fcntl(fd, F_GETFL);
+        fcntl(fd, F_SETFL, orig_mode | O_NONBLOCK);
+
 		while (rest > 0 && recycle_capture_file == 0) {
 			size_t c = (rest <= (off64_t)chunk_bytes) ?
 				(size_t)rest : chunk_bytes;
 			size_t f = c * 8 / bits_per_frame;
-			if (pcm_read(audiobuf, f) != f)
+
+            write_buffer_t *new_entry = (write_buffer_t *) malloc(sizeof(write_buffer_t));
+            if (!new_entry) {
+                perror("Out of memory, disc IO too slow (ll)");
+                prg_exit(EXIT_FAILURE);
+            }
+            new_entry->next = NULL;
+            new_entry->written = 0;
+            new_entry->len = c;
+            new_entry->data = (u_char *) malloc(c);
+            if (!new_entry->data) {
+                perror("Out of memory, disc IO too slow (buf)");
+                prg_exit(EXIT_FAILURE);
+            }
+
+			if (pcm_read(audiobuf, f) != f) {
+                free(new_entry->data);
+                free(new_entry);
 				break;
-			if (write(fd, audiobuf, c) != c) {
-				perror(name);
-				prg_exit(EXIT_FAILURE);
-			}
+            }
+            if (buf_end) {
+                buf_end->next = new_entry;
+            }
+            buf_end = new_entry;
+           
+            while (buf_start != NULL) {
+                int rc;
+                assert(buf_start->len > buf_start->written);
+                rc = write(fd, buf_start->data + buf_start->written, buf_start->len - buf_start->written);
+                if (rc == (buf_start->len - buf_start->written)) {
+                    if (buf_start == buf_end) {
+                        assert(buf_start->next == NULL);
+                        buf_end = NULL;
+                    }
+                    write_buffer_t *next = buf_start->next;
+                    free(buf_start->data);
+                    free(buf_start);
+                    buf_start = next;
+                }
+                else if (rc >= 0) {
+                    buf_start->written += rc;
+                    break;
+                }
+                else {
+                    perror(name);
+                    prg_exit(EXIT_FAILURE);
+                }
+            }
+
 			count -= c;
 			rest -= c;
 			fdcount += c;
 		}
+        fcntl(fd, F_SETFL, orig_mode);
+
+        while (buf_start != NULL) {
+            int rc;
+            assert(buf_start->len > buf_start->written);
+            rc = write(fd, buf_start->data + buf_start->written, buf_start->len - buf_start->written);
+            if (rc == (buf_start->len - buf_start->written)) {
+                write_buffer_t *next = buf_start->next;
+                free(buf_start->data);
+                free(buf_start);
+                buf_start = next;
+            }
+            else {
+                perror(name);
+                prg_exit(EXIT_FAILURE);
+            }
+        }
 
 		/* re-enable SIGUSR1 signal */
 		if (recycle_capture_file) {
